@@ -562,6 +562,14 @@ def process_mbox_file(up, parts, path):
 
 
 def main(argv=None):
+    # Folder names from mail archives can contain characters the Windows
+    # console encoding can't print; never let a progress message crash the run.
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except Exception:
+            pass
+
     ap = argparse.ArgumentParser(
         description="Restore locally cached mail to a Carbonio/IMAP server.",
         formatter_class=argparse.RawDescriptionHelpFormatter)

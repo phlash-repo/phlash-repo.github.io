@@ -5,15 +5,39 @@ archives) are gone, a fresh Carbonio server has replaced it, and the only
 remaining copies of the mail are the local caches on users' machines
 (Outlook OST files and Thunderbird profiles, both from IMAP accounts).
 
-Two tools are provided:
+The tools provided:
 
 | Script | Use for | Runs on |
 |---|---|---|
-| [`imap_restore.py`](imap_restore.py) | Thunderbird profiles, mbox files, Maildir, `.eml` trees (incl. `readpst` output from Outlook OST/PST) | Windows / macOS / Linux, Python 3.7+, no extra packages |
+| [`restore_thunderbird.ps1`](restore_thunderbird.ps1) | Thunderbird laptops — guided wrapper around `imap_restore.py` (dry-runs first, asks before uploading) | Windows |
 | [`restore_outlook.ps1`](restore_outlook.ps1) | Outlook machines where the old profile still opens | Windows with Outlook installed |
+| [`imap_restore.py`](imap_restore.py) | The engine behind the Thunderbird wrapper; also handles mbox files, Maildir, `.eml` trees (incl. `readpst` output from Outlook OST/PST) directly | Windows / macOS / Linux, Python 3.7+, no extra packages |
 
-Both are safe to re-run: they de-duplicate on Message-ID, so an interrupted
-restore just continues where it left off.
+**Default behavior — full folder replication.** Every folder in the local
+archive is recreated on the Carbonio server (including nested subfolders)
+and each email is restored into the folder it was filed in. Duplicate
+checking is per folder: a message is uploaded unless that same message is
+already in that same folder on the server. All tools are safe to re-run —
+an interrupted restore just continues where it left off.
+
+## Quick start on a Windows laptop
+
+1. Do **section 0 below first** (offline mode + backup) — it protects the
+   only remaining copy of the mail.
+2. Copy this `mail-restore` folder onto the laptop.
+3. **Thunderbird laptop:** open PowerShell in the folder and run
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\restore_thunderbird.ps1
+   ```
+
+   It finds Python (tells you how to install it if missing), auto-detects
+   the Thunderbird profile, prompts for server/account/password, shows a
+   dry run of everything it would upload, and only uploads after you
+   confirm. Add `-Insecure` if the Carbonio certificate is self-signed.
+4. **Outlook laptop:** follow section 3 (add the Carbonio IMAP account in
+   the existing Outlook profile, then run `restore_outlook.ps1`).
+5. Verify in Carbonio webmail (section 5).
 
 ---
 
@@ -64,10 +88,25 @@ Also check mailbox quotas (`zimbraMailQuota`) are large enough to hold the
 restored archive. Restore **one test mailbox first**, verify it in Carbonio
 webmail, then roll out to the rest.
 
-## 2. Thunderbird machines → `imap_restore.py`
+## 2. Thunderbird machines → `restore_thunderbird.ps1`
 
-Run on the user's machine (or against a copied profile on an admin machine).
-Only Python 3 is needed — no third-party packages.
+**On Windows, just run the wrapper** — it drives `imap_restore.py` for you
+(finds Python, auto-detects the profile, dry-runs first, asks before
+uploading):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\restore_thunderbird.ps1
+# or non-interactively:
+powershell -ExecutionPolicy Bypass -File .\restore_thunderbird.ps1 `
+    -Server mail.example.com -User alice@example.com
+```
+
+If Python 3 isn't installed yet: `winget install Python.Python.3.12`, or
+https://www.python.org/downloads/ with "Add python.exe to PATH" ticked.
+
+Running the engine directly works too (on Windows use `py` instead of
+`python3`), on the user's machine or against a copied profile on an admin
+machine. Only Python 3 is needed — no third-party packages:
 
 ```sh
 # 1. see what would be restored (auto-detects profiles on this machine)
