@@ -55,6 +55,16 @@
     target folder and skip messages that are already there. Makes re-runs
     safe after an interruption (slower on big folders).
 
+.PARAMETER DedupeScope
+    'Folder' (default): a message is skipped only if it already exists in
+    the SAME folder on the target. 'Account' (implies -Dedupe): the whole
+    target store is indexed first and a message that exists ANYWHERE in it
+    is never copied - use this when combining several sources (this script,
+    a Thunderbird restore via imap_restore.py, and mail already received by
+    the new server) that may have filed the same message in different
+    folders. Let Outlook FULLY SYNC the Carbonio account before running,
+    since the index is built from Outlook's local cache of the target.
+
 .PARAMETER ThrottleMs
     Pause this many milliseconds between item copies (default 0). Use a
     small value (e.g. 50) if Outlook or the server struggles with the load.
@@ -65,6 +75,11 @@
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\restore_outlook.ps1 `
         -SourceStore "alice@oldserver.com" -TargetStore "alice@newserver.com" -Dedupe
+
+.EXAMPLE
+    # Combining with other sources / mail already on the server: never copy a
+    # message that already exists anywhere in the Carbonio account.
+    powershell -ExecutionPolicy Bypass -File .\restore_outlook.ps1 -DedupeScope Account
 #>
 [CmdletBinding()]
 param(
@@ -73,6 +88,8 @@ param(
     [string]$PstPath,
     [switch]$DryRun,
     [switch]$Dedupe,
+    [ValidateSet('Folder', 'Account')]
+    [string]$DedupeScope = 'Folder',
     [int]$ThrottleMs = 0,
     [string[]]$SkipFolders = @('Outbox', 'Sync Issues', 'Conflicts',
         'Local Failures', 'Server Failures', 'RSS Feeds', 'RSS Subscriptions',
@@ -136,19 +153,39 @@ function Get-TargetChildFolder {
     return $Parent.Folders.Add($Name)
 }
 
-function Get-TargetMessageIds {
-    param($Folder)
-    $ids = New-Object 'System.Collections.Generic.HashSet[string]'
-    if ($null -eq $Folder) { return $ids }
+function Add-FolderMessageIds {
+    param($Folder, $Ids)
     foreach ($item in @($Folder.Items)) {
         try {
             if ($item.Class -eq $olMailClass) {
                 $id = $item.PropertyAccessor.GetProperty($PR_INTERNET_MESSAGE_ID)
-                if ($id) { [void]$ids.Add($id) }
+                if ($id) { [void]$Ids.Add($id) }
             }
         } catch { }
     }
-    return $ids
+}
+
+function Get-TargetMessageIds {
+    # The leading comma stops PowerShell unrolling the HashSet on return.
+    param($Folder)
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]'
+    if ($null -ne $Folder) { Add-FolderMessageIds -Folder $Folder -Ids $ids }
+    return ,$ids
+}
+
+function Get-AllStoreMessageIds {
+    param($Root)
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]'
+    $stack = New-Object System.Collections.Stack
+    foreach ($f in @($Root.Folders)) { $stack.Push($f) }
+    while ($stack.Count -gt 0) {
+        $f = $stack.Pop()
+        $isMail = $true
+        try { $isMail = ($f.DefaultItemType -eq $olMailItem) } catch { }
+        if ($isMail) { Add-FolderMessageIds -Folder $f -Ids $ids }
+        foreach ($sub in @($f.Folders)) { $stack.Push($sub) }
+    }
+    return ,$ids
 }
 
 function Copy-MailFolder {
@@ -174,7 +211,9 @@ function Copy-MailFolder {
         Write-Host "  $Path  ($total items)"
         if ($total -gt 0 -and -not $DryRun) {
             $existing = $null
-            if ($Dedupe) {
+            if ($null -ne $script:GlobalIds) {
+                $existing = $script:GlobalIds
+            } elseif ($Dedupe) {
                 $existing = Get-TargetMessageIds -Folder $targetFolder
                 if ($existing.Count -gt 0) {
                     Write-Host "    target already holds $($existing.Count) message(s)"
@@ -197,13 +236,14 @@ function Copy-MailFolder {
                 try {
                     $item = $ns.GetItemFromID($eid)
                     if ($item.Class -ne $olMailClass) { $script:Skipped++; continue }
-                    if ($Dedupe) {
-                        $mid = $null
+                    $mid = $null
+                    if ($null -ne $existing) {
                         try { $mid = $item.PropertyAccessor.GetProperty($PR_INTERNET_MESSAGE_ID) } catch { }
                         if ($mid -and $existing.Contains($mid)) { $script:Skipped++; continue }
                     }
                     $copy = $item.Copy()
                     [void]$copy.Move($targetFolder)
+                    if ($mid) { [void]$existing.Add($mid) }
                     $script:Copied++
                     if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
                 } catch {
@@ -255,6 +295,15 @@ Write-Host ''
 
 $srcRoot = $src.GetRootFolder()
 $dstRoot = $dst.GetRootFolder()
+
+$script:GlobalIds = $null
+if ($DedupeScope -eq 'Account') {
+    $Dedupe = $true
+    Write-Host 'Indexing existing messages across the whole target store (this reads' -ForegroundColor Cyan
+    Write-Host "Outlook's local cache - make sure the Carbonio account has fully synced)..." -ForegroundColor Cyan
+    $script:GlobalIds = Get-AllStoreMessageIds -Root $dstRoot
+    Write-Host "  $($script:GlobalIds.Count) existing message(s) indexed"
+}
 
 foreach ($folder in @($srcRoot.Folders)) {
     Copy-MailFolder -SourceFolder $folder -TargetParent $dstRoot -Path $folder.Name

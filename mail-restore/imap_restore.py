@@ -188,6 +188,7 @@ class Uploader:
         self.delimiter = "/"
         self.known_folders = set()
         self.msgid_cache = {}     # folder -> set of message-ids
+        self.global_keys = None   # account-wide key set (--dedupe-scope account)
         self.stats = {"uploaded": 0, "skipped_dupe": 0, "failed": 0,
                       "skipped_other": 0}
 
@@ -281,37 +282,78 @@ class Uploader:
             self.known_folders.add(partial)
         self.known_folders.add(folder)
 
+    def _folder_keys(self, enc):
+        """Dedupe keys of every message in one (already encoded) mailbox."""
+        ids = set()
+        typ, _ = self.imap.select(enc, readonly=True)
+        if typ != "OK":
+            return None
+        typ, data = self.imap.uid("search", None, "ALL")
+        uids = data[0].split() if typ == "OK" and data and data[0] else []
+        for i in range(0, len(uids), 500):
+            batch = b",".join(uids[i:i + 500])
+            typ, resp = self.imap.uid(
+                "fetch", batch,
+                "(BODY.PEEK[HEADER.FIELDS (%s)])" % DEDUPE_FIELDS)
+            if typ != "OK":
+                continue
+            for part in resp:
+                if isinstance(part, tuple) and part[1]:
+                    key = dedupe_key(part[1])
+                    if key:
+                        ids.add(key)
+        try:
+            self.imap.close()
+        except Exception:
+            pass
+        return ids
+
     def existing_msgids(self, folder):
         if folder in self.msgid_cache:
             return self.msgid_cache[folder]
         ids = set()
-        if not self.args.no_dedupe:
+        # Account-wide scope already indexed every folder up front.
+        if not self.args.no_dedupe and self.args.dedupe_scope == "folder":
             enc = imap_quote(imap_utf7_encode(folder))
-            typ, _ = self.imap.select(enc, readonly=True)
-            if typ == "OK":
-                typ, data = self.imap.uid("search", None, "ALL")
-                uids = data[0].split() if typ == "OK" and data and data[0] else []
-                for i in range(0, len(uids), 500):
-                    batch = b",".join(uids[i:i + 500])
-                    typ, resp = self.imap.uid(
-                        "fetch", batch,
-                        "(BODY.PEEK[HEADER.FIELDS (%s)])" % DEDUPE_FIELDS)
-                    if typ != "OK":
-                        continue
-                    for part in resp:
-                        if isinstance(part, tuple) and part[1]:
-                            key = dedupe_key(part[1])
-                            if key:
-                                ids.add(key)
-                try:
-                    self.imap.close()
-                except Exception:
-                    pass
-                if uids:
-                    log("  %d message(s) already in %r on server"
-                        % (len(uids), folder))
+            got = self._folder_keys(enc)
+            if got:
+                ids = got
+                log("  %d existing message(s) indexed in %r on server"
+                    % (len(ids), folder))
         self.msgid_cache[folder] = ids
         return ids
+
+    def scan_account_keys(self):
+        """Index the dedupe keys of every message in every folder of the
+        target account (--dedupe-scope account)."""
+        self.global_keys = set()
+        log("Indexing existing messages across the whole account ...")
+        typ, data = self.imap.list('""', '"*"')
+        if typ != "OK":
+            log("  warning: LIST failed, falling back to per-folder dedupe")
+            self.args.dedupe_scope = "folder"
+            return
+        folders = 0
+        for line in data or []:
+            if isinstance(line, tuple):      # literal-quoted mailbox name
+                flags, name = line[0], line[1]
+            else:
+                if not line:
+                    continue
+                m = re.match(rb'\(([^)]*)\)\s+(?:"[^"]*"|NIL)\s+(.+)$', line)
+                if not m:
+                    continue
+                flags, name = m.group(1), m.group(2).strip()
+                if name.startswith(b'"') and name.endswith(b'"'):
+                    name = name[1:-1].replace(b'\\"', b'"').replace(b"\\\\", b"\\")
+            if b"\\Noselect" in flags or b"\\NoSelect" in flags:
+                continue
+            got = self._folder_keys(imap_quote(name.decode("ascii", "replace")))
+            if got is not None:
+                folders += 1
+                self.global_keys |= got
+        log("  %d existing message(s) indexed across %d folder(s)"
+            % (len(self.global_keys), folders))
 
     # -- messages ---------------------------------------------------------
 
@@ -320,7 +362,9 @@ class Uploader:
         a = self.args
         key = dedupe_key(header_block(raw))
         seen = self.existing_msgids(folder)
-        if key and key in seen:
+        if key and (key in seen
+                    or (self.global_keys is not None
+                        and key in self.global_keys)):
             self.stats["skipped_dupe"] += 1
             return
         if a.max_size and len(raw) > a.max_size:
@@ -332,6 +376,8 @@ class Uploader:
             self.stats["uploaded"] += 1
             if key:
                 seen.add(key)
+                if self.global_keys is not None:
+                    self.global_keys.add(key)
             return
 
         body = re.sub(rb"\r?\n", b"\r\n", raw)
@@ -346,6 +392,8 @@ class Uploader:
                     self.stats["uploaded"] += 1
                     if key:
                         seen.add(key)
+                        if self.global_keys is not None:
+                            self.global_keys.add(key)
                     if a.throttle:
                         time.sleep(a.throttle)
                     return
@@ -552,6 +600,16 @@ def main(argv=None):
                     help="show what would be uploaded without changing anything")
     ap.add_argument("--no-dedupe", action="store_true",
                     help="skip the Message-ID duplicate check")
+    ap.add_argument("--dedupe-scope", choices=("folder", "account"),
+                    default="folder",
+                    help="'folder' (default): skip a message only if it is "
+                         "already in the SAME folder on the server. "
+                         "'account': index every folder first and never "
+                         "upload a message that exists ANYWHERE in the "
+                         "mailbox - use this when combining several sources "
+                         "(Outlook + Thunderbird + mail already received by "
+                         "the new server) that may have filed the same "
+                         "message in different folders.")
     ap.add_argument("--max-size", type=int, default=0, metavar="BYTES",
                     help="skip messages larger than this (0 = no limit)")
     ap.add_argument("--throttle", type=float, default=0.0, metavar="SECONDS",
@@ -591,6 +649,8 @@ def main(argv=None):
     failures = FailureLog(args.log)
     up = Uploader(args, failures)
     up.connect()
+    if args.dedupe_scope == "account" and not args.no_dedupe:
+        up.scan_account_keys()
     if args.dry_run:
         log("*** DRY RUN - nothing will be uploaded ***")
 

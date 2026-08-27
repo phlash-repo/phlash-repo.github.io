@@ -148,7 +148,55 @@ python3 imap_restore.py --server mail.example.com --user alice@example.com \
 The same recipe works for any old `.pst` archive files you find lying
 around.
 
-## 4. Verify
+## 4. Combining sources — Outlook + Thunderbird + mail already on the server
+
+All of the above can safely target the same mailbox. Both tools check the
+target for duplicates before uploading (Message-ID, with a Date/From/Subject
+fingerprint as fallback), so:
+
+- **Mail the new Carbonio server has already received** stays untouched, and
+  a local cached copy of the same message is skipped, not duplicated.
+- **The same message present in both Outlook and Thunderbird** is only
+  restored once — whichever source runs first wins.
+- **Interrupted runs** can simply be re-run.
+
+By default the duplicate check is *per folder*: a message is skipped only if
+it is already in the same folder on the server. That is right for a plain
+restore, but when combining sources the same message often lives in
+*different* folders in different places — e.g. still in `INBOX` on the
+server (redelivered after the migration) but filed under a project folder
+in someone's Thunderbird, or filed differently by the Outlook and
+Thunderbird users. For that, switch to **account-wide dedupe**, which
+indexes every folder first and never uploads a message that exists
+anywhere in the mailbox:
+
+```sh
+python3 imap_restore.py --server mail.example.com --user alice@example.com \
+    --thunderbird ... --dedupe-scope account
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\restore_outlook.ps1 -DedupeScope Account
+```
+
+Recommended order per mailbox:
+
+1. Leave whatever the new server has already received exactly as it is —
+   the restore works around it.
+2. Restore the **richest/most complete archive first** (usually the one
+   with the longest history); with account-wide dedupe its filing wins.
+3. Run the remaining sources afterwards — they only fill in the gaps.
+
+Two caveats:
+
+- With `-DedupeScope Account` the Outlook script builds its index from
+  Outlook's local cache of the Carbonio account, so let that account
+  **fully sync** (all folders, Send/Receive quiet) before running.
+- Account-wide dedupe keeps *one* copy per mailbox. If you genuinely want
+  the same message in two folders (rare), stay with the per-folder default
+  for that source.
+
+## 5. Verify
 
 - Compare per-folder message counts between the client and Carbonio webmail.
 - Check `imap_restore_failures.log` / the PowerShell failure count; the
